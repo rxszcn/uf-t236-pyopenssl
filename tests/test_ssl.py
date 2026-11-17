@@ -4705,6 +4705,98 @@ class TestMemoryBIO:
 
         self._check_client_ca_list(set_replaces_add_ca)
 
+    def _frozen_clock_handshake(
+        self, frozen_time: datetime.datetime | None
+    ) -> tuple[Connection, Connection, list[tuple[int, int, int, str | None]]]:
+        """
+        Build a memory-BIO client/server pair backed by a freshly generated
+        three-certificate chain (root -> intermediate -> leaf).  The client
+        trusts the root through ``Context.get_cert_store`` and, when
+        *frozen_time* is given, freezes the verification clock on that very
+        same store.  The client's verify callback records every preverify
+        outcome as ``(errnum, depth, ok, subject CN)`` tuples.
+
+        Returning the two not-yet-interacted connections together with the
+        recorded events lets a caller drive ``interact_in_memory`` itself.
+        """
+        [(_, cacert), (_, icert), (skey, scert)] = _create_certificate_chain()
+
+        server_ctx = Context(SSLv23_METHOD)
+        server_ctx.use_privatekey(skey)
+        server_ctx.use_certificate(scert)
+        server_ctx.add_extra_chain_cert(icert.to_cryptography())
+        server = Connection(server_ctx, None)
+        server.set_accept_state()
+
+        events: list[tuple[int, int, int, str | None]] = []
+
+        def recording_verify_cb(
+            conn: Connection, cert: X509, errnum: int, depth: int, ok: int
+        ) -> bool:
+            events.append((errnum, depth, ok, cert.get_subject().CN))
+            return bool(ok)
+
+        client_ctx = Context(SSLv23_METHOD)
+        cert_store = client_ctx.get_cert_store()
+        assert cert_store is not None
+        # Trusting the root and freezing the clock both go through the same
+        # native X509_STORE that the SSL_CTX uses during the handshake.
+        cert_store.add_cert(cacert)
+        if frozen_time is not None:
+            cert_store.set_time(frozen_time)
+        client_ctx.set_verify(VERIFY_PEER, recording_verify_cb)
+        client = Connection(client_ctx, None)
+        client.set_connect_state()
+
+        return client, server, events
+
+    def test_frozen_time_propagates_into_handshake(self) -> None:
+        """
+        A verification time set on ``Context.get_cert_store`` reaches the
+        certificate validation performed during the TLS handshake.
+
+        The generated chain becomes valid at 2000-01-01.  Freezing the client
+        store clock at 1999 makes every chain certificate "not yet valid";
+        the handshake must then fail with `OpenSSL.SSL.Error`, and the verify
+        callback must observe the native ``X509_V_ERR_CERT_NOT_YET_VALID``
+        code attributed to the chain root at depth 2.  This only happens if
+        the store handed out by ``get_cert_store`` is the live store used by
+        the handshake rather than an unrelated freshly allocated one.
+        """
+        client, server, events = self._frozen_clock_handshake(
+            datetime.datetime(1999, 6, 1)
+        )
+
+        with pytest.raises(Error):
+            interact_in_memory(client, server)
+
+        failed = [event for event in events if event[2] == 0]
+        assert failed, (
+            "the verify callback never observed a failed certificate"
+        )
+        errnum, depth, _ok, cn = failed[0]
+        assert errnum == _lib.X509_V_ERR_CERT_NOT_YET_VALID
+        assert depth == 2
+        assert cn == "Authority Certificate"
+
+    def test_frozen_time_within_validity_allows_handshake(self) -> None:
+        """
+        Freezing the verification clock at a moment inside the chain's
+        validity window leaves the handshake successful.
+
+        Together with `test_frozen_time_propagates_into_handshake` this pins
+        both directions of the frozen-clock behavior: an implementation that
+        ignored ``set_time`` on the context store could never fail the first
+        test, while one that always failed could never pass this one.
+        """
+        client, server, events = self._frozen_clock_handshake(
+            datetime.datetime(2025, 6, 1)
+        )
+
+        assert interact_in_memory(client, server) is None
+        assert events
+        assert all(event[2] == 1 for event in events)
+
 
 class TestInfoConstants:
     """

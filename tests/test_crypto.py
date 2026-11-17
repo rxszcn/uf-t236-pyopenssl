@@ -2014,6 +2014,70 @@ class TestX509Store:
         with pytest.raises(Error):
             store.load_locations(cafile=str(invalid_ca_file))
 
+    @pytest.mark.parametrize("set_time_first", [False, True])
+    def test_set_flags_and_set_time_are_order_independent(
+        self, set_time_first: bool
+    ) -> None:
+        """
+        `X509Store.set_flags` and `X509Store.set_time` may be called in
+        either order without losing either setting.
+
+        The merge is observed behaviorally through ``CRL_CHECK``: with that
+        flag set but no CRL added to the store, verification must fail with
+        "unable to get certificate CRL".  If ``set_time`` replaced the
+        store's verify parameters instead of merging into them (or the call
+        order mattered), the flag would be lost in one ordering and the same
+        verification would succeed.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.add_cert(load_certificate(FILETYPE_PEM, intermediate_cert_pem))
+
+        def set_flags() -> None:
+            store.set_flags(X509StoreFlags.CRL_CHECK)
+
+        def set_time() -> None:
+            store.set_time(datetime(2025, 1, 1))
+
+        if set_time_first:
+            set_time()
+            set_flags()
+        else:
+            set_flags()
+            set_time()
+
+        store_ctx = X509StoreContext(
+            store,
+            load_certificate(FILETYPE_PEM, intermediate_server_cert_pem),
+        )
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert str(exc.value) == "unable to get certificate CRL"
+
+    def test_set_time_merges_with_previously_set_flags(self) -> None:
+        """
+        `X509Store.set_time` keeps verification flags configured earlier.
+
+        ``CRL_CHECK`` without a matching CRL makes verification fail.  The
+        failure must survive a subsequent ``set_time`` call, proving the
+        frozen-time parameters are merged into the store rather than
+        replacing it.  A ``set_time`` implementation that dropped the
+        previously set flags would verify successfully instead.
+        """
+        store = X509Store()
+        store.add_cert(load_certificate(FILETYPE_PEM, root_cert_pem))
+        store.add_cert(load_certificate(FILETYPE_PEM, intermediate_cert_pem))
+        store.set_flags(X509StoreFlags.CRL_CHECK)
+        store.set_time(datetime(2025, 1, 1))
+
+        store_ctx = X509StoreContext(
+            store,
+            load_certificate(FILETYPE_PEM, intermediate_server_cert_pem),
+        )
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+        assert str(exc.value) == "unable to get certificate CRL"
+
 
 def _runopenssl(pem: bytes, *args: bytes) -> bytes:
     """
@@ -2845,6 +2909,88 @@ class TestX509StoreContext:
             store_ctx.verify_certificate()
 
         assert str(exc.value) == "certificate has expired"
+
+    def test_expired_error_is_code_depth_message_triple(self) -> None:
+        """
+        On expiry, `X509StoreContextError.errors` is a three-element
+        ``(error code, error depth, message)`` triple and ``certificate``
+        names the certificate OpenSSL holds responsible.
+
+        Freezing the clock at the leaf's notAfter makes every certificate in
+        the chain expire at the same instant; OpenSSL then attributes the
+        failure to the chain root, at depth 2.  Asserting the native
+        ``X509_V_ERR_CERT_HAS_EXPIRED`` code, the depth, the message and the
+        attributed certificate's identity locks the whole construction of
+        `X509StoreContext._exception_from_context`: swapping the code/depth
+        fields, dropping the message, or attributing the wrong certificate
+        all fail this test.
+        """
+        store = X509Store()
+        store.add_cert(self.root_cert)
+        store.add_cert(self.intermediate_cert)
+
+        expire_time = self.intermediate_server_cert.get_notAfter()
+        assert expire_time is not None
+        expire_datetime = datetime.strptime(
+            expire_time.decode("utf-8"), "%Y%m%d%H%M%SZ"
+        )
+        store.set_time(expire_datetime)
+
+        store_ctx = X509StoreContext(store, self.intermediate_server_cert)
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+
+        error = exc.value
+        assert isinstance(error.errors, list)
+        assert len(error.errors) == 3
+        code, depth, message = error.errors
+        # The triple must keep its precise element types and order.
+        assert code == _lib.X509_V_ERR_CERT_HAS_EXPIRED
+        assert isinstance(code, int)
+        assert depth == 2
+        assert isinstance(depth, int)
+        assert message == "certificate has expired"
+        assert isinstance(message, str)
+        assert str(error) == message
+        # The error is attributed to the chain root at depth 2, not to the
+        # leaf that was handed to the store context.
+        assert error.certificate.get_subject().CN == "Testing Root CA"
+        assert (
+            error.certificate.to_cryptography()
+            == self.root_cert.to_cryptography()
+        )
+
+    def test_missing_issuer_error_depth_attributes_leaf(self) -> None:
+        """
+        A failure caused by a missing issuer certificate is attributed to the
+        certificate whose issuer is missing, at depth 0, with its own native
+        error code.
+
+        Together with `test_expired_error_is_code_depth_message_triple` this
+        distinguishes depth attribution: the expiry case reports depth 2 /
+        root while this case reports depth 0 / leaf.  An implementation that
+        hard-coded either depth or always attributed the input certificate
+        can pass at most one of the two tests.
+        """
+        store = X509Store()
+        store.add_cert(self.root_cert)
+
+        store_ctx = X509StoreContext(store, self.intermediate_server_cert)
+        with pytest.raises(X509StoreContextError) as exc:
+            store_ctx.verify_certificate()
+
+        code, depth, message = exc.value.errors
+        assert code == _lib.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+        assert depth == 0
+        assert message == "unable to get local issuer certificate"
+        assert isinstance(code, int)
+        assert isinstance(depth, int)
+        assert isinstance(message, str)
+        assert (
+            exc.value.certificate.to_cryptography()
+            == self.intermediate_server_cert.to_cryptography()
+        )
+        assert exc.value.certificate.get_subject().CN == "intermediate-service"
 
     def test_get_verified_chain(self) -> None:
         """
